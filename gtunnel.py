@@ -1,7 +1,7 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
 
-import gevnet.server
+import gevent.server
 
 
 class Client(gevent.server.StreamServer):
