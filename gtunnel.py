@@ -215,6 +215,8 @@ class TunnelServer(gevent.server.StreamServer):
                 data = backend.recv(65536)
             except gevent.socket.timeout:
                 continue
+            except gevent.socket.error:
+                break
             if data:
                 encrypted_data = self.crypto.encrypt(data)
                 header = struct.pack(
