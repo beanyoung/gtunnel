@@ -75,6 +75,7 @@ class TunnelClient(gevent.server.StreamServer):
                     self.backend = gevent.socket.create_connection(
                         self.backend_address, default_timeout)
                 while True:
+                    # read message
                     print '2'
                     header = read_bytes(self.backend, header_bit_format_size)
                     if len(header) != header_bit_format_size:
@@ -93,7 +94,7 @@ class TunnelClient(gevent.server.StreamServer):
                             self.close_all_tunnels()
                             break
                         if tunnel_id in self.tunnels:
-                            self.tunnels[tunnel_id].send(
+                            self.tunnels[tunnel_id].sendall(
                                 self.crypto.decrypt(encrypted_data))
             except Exception as e:
                 print 'connect_to_backend error', e
@@ -115,7 +116,7 @@ class TunnelClient(gevent.server.StreamServer):
             if not self.tunnels[tunnel_id].closed:
                 self.tunnels[tunnel_id].close()
             if self.backend and not self.backend.closed:
-                self.backend.send(struct.pack(header_bit_format, tunnel_id, 0))
+                self.backend.sendall(struct.pack(header_bit_format, tunnel_id, 0))
             self.tunnels.pop(tunnel_id)
 
     @log_request
@@ -133,7 +134,7 @@ class TunnelClient(gevent.server.StreamServer):
         try:
             tunnel_id = self.open_tunnel(sock)
             header = struct.pack(header_bit_format, tunnel_id, -1)
-            self.backend.send(header)
+            self.backend.sendall(header)
             while True:
                 print 'while'
                 if sock.closed:
@@ -146,8 +147,8 @@ class TunnelClient(gevent.server.StreamServer):
                     encrypted_data = self.crypto.encrypt(data)
                     header = struct.pack(
                         header_bit_format, tunnel_id, len(encrypted_data))
-                    print 'send', tunnel_id, len(encrypted_data)
-                    self.backend.send(header + encrypted_data)
+                    print 'sendall', tunnel_id, len(encrypted_data)
+                    self.backend.sendall(header + encrypted_data)
                 else:
                     self.close_tunnel(tunnel_id)
                     break
@@ -172,7 +173,7 @@ class TunnelServer(gevent.server.StreamServer):
         except Exception as e:
             print 'open_tunnel error', e
             if not sock.closed:
-                sock.send(struct.pack(header_bit_format, tunnel_id, 0))
+                sock.sendall(struct.pack(header_bit_format, tunnel_id, 0))
             self.close_tunnel(tunnels, tunnel_id)
             return
         gevent.spawn(
@@ -185,7 +186,7 @@ class TunnelServer(gevent.server.StreamServer):
             try:
                 data = tunnels[tunnel_id]['queue'].get(timeout=default_timeout)
                 print 'write to backend', tunnel_id, len(data)
-                backend.send(data)
+                backend.sendall(data)
             except gevent.queue.Empty:
                 if sock.closed:
                     self.close_tunnel(tunnels, tunnel_id)
@@ -196,7 +197,7 @@ class TunnelServer(gevent.server.StreamServer):
                     continue
 
                 if backend.closed:
-                    sock.send(struct.pack(
+                    sock.sendall(struct.pack(
                         header_bit_format_size, tunnel_id, 0))
                     self.close_tunnel(tunnels, tunnel_id)
                     break
@@ -221,7 +222,7 @@ class TunnelServer(gevent.server.StreamServer):
                 encrypted_data = self.crypto.encrypt(data)
                 header = struct.pack(
                     header_bit_format, tunnel_id, len(encrypted_data))
-                sock.send(header + encrypted_data)
+                sock.sendall(header + encrypted_data)
             else:
                 break
 
@@ -259,7 +260,7 @@ class TunnelServer(gevent.server.StreamServer):
                         tunnels[tunnel_id]['queue'].put(
                             self.crypto.decrypt(encrypted_data))
                     else:
-                        sock.send(
+                        sock.sendall(
                             struct.pack(header_bit_format, tunnel_id, 0))
             except Exception as e:
                 print 'handle error', e
