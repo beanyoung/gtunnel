@@ -1,9 +1,12 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
 
+import base64
 import functools
+import hashlib
 import struct
 
+import cryptography.fernet
 import gevent
 import gevent.queue
 import gevent.lock
@@ -282,7 +285,8 @@ if __name__ == '__main__':
     backend_address = (args.backend.split(':')[0],
                        int(args.backend.split(':')[1]))
 
-    crypto = Crypto(args.secret)
+    crypto = cryptography.fernet.Fernet(
+        base64.urlsafe_b64encode(hashlib.md5(args.secret).hexdigest()))
 
     if args.client_mode:
         server = TunnelClient(
