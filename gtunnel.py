@@ -6,12 +6,11 @@ import struct
 
 import gevent
 import gevent.queue
+import gevent.lock
 import gevent.server
 import gevent.socket
 
 
-# default_timeout = 100
-default_timeout = 3
 header_bit_format = '!Qi'
 header_bit_format_size = struct.calcsize(header_bit_format)
 
@@ -26,16 +25,15 @@ def log_request(f):
     return decorator
 
 
-@log_request
-def read_bytes(sock, size):
-    if size <= 0:
+def read_bytes(sock, num_bytes):
+    if num_bytes <= 0:
         return ''
     ret = ''
-    while len(ret) < size:
+    while len(ret) < num_bytes:
         try:
-            buf = sock.recv(size - len(ret))
-        except gevent.socket.timeout as e:
-            continue
+            buf = sock.recv(num_bytes - len(ret))
+        except gevent.socket.error:
+            return ret
         if not buf:
             return ret
         ret += buf
@@ -61,101 +59,91 @@ class TunnelClient(gevent.server.StreamServer):
 
         self.tunnels = dict()
         self.tunnel_id = 0
+        self.tunnel_lock = gevent.lock.Semaphore()
 
-        gevent.spawn(self.connect_to_backend)
+        gevent.spawn(self.read_from_backend_and_put_to_queue)
 
         super(TunnelClient, self).__init__(*args, **kwargs)
 
-    @log_request
-    def connect_to_backend(self):
+    def read_from_backend_and_put_to_queue(self):
         while True:
-            try:
-                if not self.backend or self.backend.closed:
-                    print '1'
+            # close all tunnel
+            for q in self.tunnels.itervalues():
+                q.put('')
+
+            if not self.backend or self.backend.closed:
+                try:
                     self.backend = gevent.socket.create_connection(
-                        self.backend_address, default_timeout)
-                while True:
-                    # read message
-                    print '2'
-                    header = read_bytes(self.backend, header_bit_format_size)
-                    if len(header) != header_bit_format_size:
-                        self.backend.close()
-                        self.close_all_tunnels()
-                        break
-                    tunnel_id, body_size = struct.unpack(
-                        header_bit_format, header)
-                    print 'read from backend', tunnel_id, body_size
-                    if body_size == 0:
-                        self.close_tunnel(tunnel_id)
-                    else:
-                        encrypted_data = read_bytes(self.backend, body_size)
-                        if len(encrypted_data) != body_size:
-                            self.backend.close()
-                            self.close_all_tunnels()
-                            break
-                        if tunnel_id in self.tunnels:
-                            self.tunnels[tunnel_id].sendall(
-                                self.crypto.decrypt(encrypted_data))
-            except Exception as e:
-                print 'connect_to_backend error', e
-            finally:
-                print 'here'
-                if self.backend and self.backend.closed:
-                    self.close_all_tunnels()
+                        self.backend_address)
+                except gevent.socket.error:
+                    break
 
-    @log_request
-    def open_tunnel(self, sock):
-        self.tunnel_id += 1
-        tunnel_id = self.tunnel_id
-        self.tunnels[tunnel_id] = sock
-        return tunnel_id
-
-    @log_request
-    def close_tunnel(self, tunnel_id):
-        if tunnel_id in self.tunnels:
-            if not self.tunnels[tunnel_id].closed:
-                self.tunnels[tunnel_id].close()
-            if self.backend and not self.backend.closed:
-                self.backend.sendall(struct.pack(header_bit_format, tunnel_id, 0))
-            self.tunnels.pop(tunnel_id)
-
-    @log_request
-    def close_all_tunnels(self):
-        for sock in self.tunnels.itervalues():
-            if not sock.closed:
-                sock.close()
-        self.tunnels = dict()
-
-    @log_request
-    def handle(self, sock, address):
-        if not self.backend or self.backend.closed:
-            sock.close()
-            return
-        try:
-            tunnel_id = self.open_tunnel(sock)
-            header = struct.pack(header_bit_format, tunnel_id, -1)
-            self.backend.sendall(header)
             while True:
-                print 'while'
-                if sock.closed:
-                    self.close_tunnel(tunnel_id)
+                header = read_bytes(self.backend, header_bit_format_size)
+                if len(header) != header_bit_format_size:
+                    self.backend.close()
                     break
-                if not self.backend or self.backend.closed:
-                    break
-                data = sock.recv(65536)
-                if data:
-                    encrypted_data = self.crypto.encrypt(data)
-                    header = struct.pack(
-                        header_bit_format, tunnel_id, len(encrypted_data))
-                    print 'sendall', tunnel_id, len(encrypted_data)
-                    self.backend.sendall(header + encrypted_data)
+
+                tunnel_id, body_size = struct.unpack(
+                    header_bit_format, header)
+
+                if body_size == 0:
+                    if tunnel_id in self.tunnels:
+                        self.tunnels[tunnel_id].put('')
                 else:
-                    self.close_tunnel(tunnel_id)
-                    break
-        except Exception as e:
-            print 'handle error', e
+                    encrypted_data = read_bytes(self.backend, body_size)
+                    if len(encrypted_data) != body_size:
+                        self.backend.close()
+                        break
+                    if tunnel_id in self.tunnels:
+                        self.tunnels[tunnel_id].put(
+                            self.crypto.decrypt(encrypted_data))
+            # sleep for a while
+            gevent.sleep(5)
+
+    def get_from_queue_and_write_to_client(self, q, sock):
+        while True:
+            data = q.get()
+            if not data:
+                sock.close()
+                break
+            if sock.closed:
+                break
+            sock.sendall(data)
+
+
+    def read_from_client_and_write_to_upstream(self, sock, tunnel_id):
+        data = sock.recv(65536)
+        if not data:
+            return
+
+        buf = []
+        encrypted_data = self.crypto.encrypt(data)
+        header = struct.pack(
+            header_bit_format, tunnel_id, len(encrypted_data))
+        buf.append(header)
+        buf.append(encrypted_data)
+        if sock.closed:
+            close_header = struct.pack(header_bit_format, tunnel_id, 0)
+            buf.append(close_header)
+        if not self.backend or self.backend.closed:
+            return
+        self.backend.sendall(''.join(buf))
+
+
+    def handle(self, sock, address):
+        with self.tunnel_lock:
+            self.tunnel_id += 1
+            tunnel_id = self.tunnel_id
+        q = gevent.queue.Queue()
+        self.tunnels[tunnel_id] = q
+        try:
+            writer = gevent.spawn(
+                self.get_from_queue_and_write_to_client, q, sock)
+            self.read_from_client_and_write_to_upstream(sock, tunnel_id)
         finally:
-            self.close_tunnel(tunnel_id)
+            writer.kill()
+            del self.tunnels[tunnel_id]
 
 
 class TunnelServer(gevent.server.StreamServer):
